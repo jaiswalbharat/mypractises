@@ -379,6 +379,55 @@ val validationResults: List[ValidationResult] = List(
 // Process validation results
 actionHandler.processValidationResults(validationResults)
 
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+
+class ActionChecker(spark: SparkSession, emailService: EmailService) {
+
+  private val validationLogTable = "validation_logs"
+
+  def checkPendingActions(jobId: String): Unit = {
+    val validationResults = loadValidationResults(jobId)
+
+    // Identify failed validations that require action
+    val failedValidations = validationResults
+      .filter($"status" === "FAILED" && $"action_taken".isNull)
+
+    if (failedValidations.count() > 0) {
+      sendConsolidatedAlert(failedValidations)
+      markActionsAsProcessed(failedValidations)
+    }
+  }
+
+  private def loadValidationResults(jobId: String): DataFrame = {
+    spark.read.table(validationLogTable)
+      .filter($"job_id" === jobId)
+  }
+
+  private def sendConsolidatedAlert(failedValidations: DataFrame): Unit = {
+    val alertMessage = failedValidations.collect().map(row =>
+      s"Offer ID: ${row.getAs[String]("offer_id")}, " +
+      s"Validation: ${row.getAs[String]("validation_type")}, " +
+      s"Message: ${row.getAs[String]("message")}"
+    ).mkString("\n")
+
+    emailService.sendEmail(
+      subject = "Pending Validation Alerts",
+      body = alertMessage
+    )
+  }
+
+  private def markActionsAsProcessed(failedValidations: DataFrame): Unit = {
+    failedValidations.withColumn("action_taken", lit("YES"))
+      .write.mode("overwrite").saveAsTable(validationLogTable)
+  }
+}
+
+val emailService = new DefaultEmailService()
+val actionChecker = new ActionChecker(spark, emailService)
+
+// If running as a rerun job, check for pending actions
+actionChecker.checkPendingActions(jobId = "20250318_001")
 
 
 

@@ -1,0 +1,322 @@
+import ujson._
+
+class ConfigResolver extends ConfigResolverTrait {
+  private val variablePattern = "\\$\\{([a-zA-Z0-9._-]+)\\}".r
+
+  override def resolveDynamicVariables(configJson: Value, properties: Properties): Value = {
+    configJson match {
+      case Obj(fields) =>
+        // Recursively resolve each field in the JSON object
+        Obj(fields.map { case (key, value) => (key, resolveDynamicVariables(value, properties)) })
+
+      case Arr(values) =>
+        // Recursively resolve each element in the JSON array
+        Arr(values.map(value => resolveDynamicVariables(value, properties)))
+
+      case Str(value) =>
+        // Replace dynamic variables in string values
+        variablePattern.replaceAllIn(value, matcher => {
+          val variableName = matcher.group(1)
+          Option(properties.getProperty(variableName))
+            .getOrElse(throw new IllegalArgumentException(s"Dynamic variable '$variableName' not found in properties"))
+        })
+
+      case other => other // For non-string types, return as is
+    }
+  }
+}
+
+
+
+import ujson.Value
+import java.util.Properties
+
+trait ConfigResolverTrait {
+  def resolveDynamicVariables(configJson: Value, properties: Properties): Value
+}
+
+
+
+
+
+object ValidationFramework {
+  def main(args: Array[String]): Unit = {
+    val propertiesFilePath = args(0) // First argument: path to properties file
+    val rerun = args(1).toBoolean // Second argument: "true" or "false"
+    val rerunJobId = if (args.length > 2) Some(args(2)) else None // Third argument: job ID for rerun
+
+    val spark = SparkSession.builder().appName("Validation Framework").enableHiveSupport().getOrCreate()
+
+    // Read properties using PropertyFileIO
+    val ioModule = new PropertyFileIO()
+    val properties = ioModule.readProperties(propertiesFilePath)
+
+    val maxRetries = properties.getProperty("maxRetries").toInt
+    val maxParallelism = properties.getProperty("maxParallelism").toInt
+    val jsonConfigPath = properties.getProperty("jsonConfigPath")
+
+    val gson = new Gson()
+    val reader = new FileReader(jsonConfigPath)
+    val config: Config = gson.fromJson(reader, classOf[Config])
+
+    val jobManager = new JobManager(spark)
+    val jobId = if (rerun) rerunJobId.get else java.util.UUID.randomUUID().toString
+
+    val queryRunner = new QueryRunner(spark, config.engine, jobId)
+    val validationEngine = new ValidationEngine()
+    val actionHandler = new ActionHandler()
+    val logger = new LineageLogger(spark)
+    val actionChecker = new ActionChecker(spark)
+    val queryExecutor = new QueryExecutor(spark, queryRunner, validationEngine, actionHandler, logger, actionChecker, properties, maxRetries, maxParallelism)
+
+    val completedQueries = if (rerun) jobManager.getCompletedQueries(jobId) else Set.empty[String]
+    val mailStatus = if (rerun) jobManager.getMailStatus(jobId) else "PENDING"
+
+    if (mailStatus == "SENT") {
+      println("Mail action already completed. No further action needed.")
+      spark.stop()
+      return
+    }
+
+    jobManager.updateJobStatus(jobId, "RUNNING")
+
+    queryExecutor.executeQueries(config, jobId, completedQueries).onComplete { _ =>
+      jobManager.updateJobStatus(jobId, "COMPLETED")
+      actionChecker.checkAndConsolidateActions(jobId)
+      jobManager.updateMailStatus(jobId, "SENT")
+      spark.stop()
+    }
+  }
+}
+
+
+
+
+
+
+# System-level properties
+maxRetries=3
+maxParallelism=5
+jsonConfigPath=/path/to/config.json
+
+# Dynamic variables
+database=my_database
+
+
+
+class QueryExecutor(
+    spark: SparkSession,
+    queryRunner: QueryRunner,
+    validationEngine: ValidationEngine,
+    actionHandler: ActionHandler,
+    logger: LineageLogger,
+    actionChecker: ActionChecker,
+    properties: Properties,
+    maxRetries: Int,
+    maxParallelism: Int
+) {
+  private implicit val ec: ExecutionContext = ExecutionContext.fromExecutor(Executors.newFixedThreadPool(maxParallelism))
+
+  def executeQueries(config: Config, jobId: String, completedQueries: Set[String]): Future[Unit] = {
+    val queriesToRun = config.queries.filterNot(query => completedQueries.contains(query.id))
+
+    val queryFutures = queriesToRun.map { query =>
+      retry(maxRetries) {
+        Future {
+          logger.logStep(query.id, "STARTED", query.description)
+          try {
+            // Resolve dynamic variables in the query
+            val resolvedSql = resolveDynamicVariables(query.sql, properties)
+            val df = queryRunner.runQuery(resolvedSql, query.id)
+            validationEngine.validate(df, query, jobId, resolvedSql, logger, actionHandler)
+            logger.logStep(query.id, "COMPLETED", s"Query ${query.id} completed successfully.")
+          } catch {
+            case e: Exception =>
+              logger.logStep(query.id, "FAILED", s"Error: ${e.getMessage}", Some(e.getMessage))
+              throw e
+          }
+        }
+      }
+    }
+
+    Future.sequence(queryFutures).map(_ => ())
+  }
+
+  // Retry logic with a limit on attempts
+  private def retry[T](maxRetries: Int)(block: => Future[T]): Future[T] = {
+    block.recoverWith {
+      case _ if maxRetries > 0 => retry(maxRetries - 1)(block)
+    }
+  }
+}
+
+
+
+
+class QueryRunner(spark: SparkSession, engine: String, jobId: String) {
+  def runQuery(sql: String, queryId: String): DataFrame = {
+    try {
+      val df = engine match {
+        case "hive" | "spark" => spark.sql(sql)
+        case _ => throw new IllegalArgumentException(s"Invalid SQL engine: $engine")
+      }
+      saveQueryResult(queryId, "SUCCESS")
+      df
+    } catch {
+      case e: Exception =>
+        saveQueryResult(queryId, "FAILED", Some(e.getMessage))
+        throw e
+    }
+  }
+
+  private def saveQueryResult(queryId: String, status: String, errorMessage: Option[String] = None): Unit = {
+    val resultsTable = "query_execution_results"
+    val timestamp = java.time.LocalDateTime.now.toString
+    val errorMsg = errorMessage.getOrElse("")
+
+    spark.sql(s"""
+      INSERT INTO $resultsTable VALUES ('$jobId', '$queryId', '$status', '$timestamp', '${errorMsg.replace("'", "''")}')
+    """)
+  }
+}
+
+
+
+trait ValidationStrategy {
+  def validate(df: DataFrame, validation: Validation, queryId: String, jobId: String, querySql: String, logger: LineageLogger, actionHandler: ActionHandler): Unit
+
+  def logValidationResult(
+      spark: SparkSession,
+      jobId: String,
+      queryId: String,
+      querySql: String,
+      groupKey: String,
+      validationType: String,
+      condition: String,
+      threshold: Option[Double],
+      resultValue: Double,
+      status: String,
+      message: String
+  ): Unit = {
+    val logsTable = "validation_logs"
+    val timestamp = java.time.LocalDateTime.now.toString
+
+    spark.sql(s"""
+      INSERT INTO $logsTable VALUES (
+        '$jobId', '$queryId', '${querySql.replace("'", "''")}', '$groupKey',
+        '$validationType', '$condition', ${threshold.getOrElse("NULL")},
+        $resultValue, '$status', '${message.replace("'", "''")}', '$timestamp'
+      )
+    """)
+  }
+}
+
+
+class CountValidationStrategy(spark: SparkSession) extends ValidationStrategy {
+  override def validate(df: DataFrame, validation: Validation, queryId: String, jobId: String, querySql: String, logger: LineageLogger, actionHandler: ActionHandler): Unit = {
+    val column = validation.column.get
+    val count = df.agg(org.apache.spark.sql.functions.count(column)).first().getLong(0)
+
+    validation.rules.foreach { rule =>
+      val isBreached = rule.condition match {
+        case "EQUAL" => count == rule.value.get
+        case "GREATER_THAN" => count > rule.value.get
+        case "LESS_THAN" => count < rule.value.get
+        case _ => false
+      }
+
+      val status = if (isBreached) "FAILED" else "PASSED"
+      val message = if (isBreached) s"Count validation failed for $queryId" else s"Count validation passed for $queryId"
+
+      logValidationResult(
+        spark, jobId, queryId, querySql, "ALL", "count",
+        rule.condition, rule.value, count.toDouble, status, message
+      )
+
+      if (isBreached) {
+        actionHandler.handleAction(rule, queryId, count.toString, logger)
+      }
+    }
+  }
+}
+
+
+class RangeValidationStrategy(spark: SparkSession) extends ValidationStrategy {
+  override def validate(df: DataFrame, validation: Validation, queryId: String, jobId: String, querySql: String, logger: LineageLogger, actionHandler: ActionHandler): Unit = {
+    val column = validation.column.get
+    val lowerBound = validation.rules.head.lower_bound.get
+    val upperBound = validation.rules.head.upper_bound.get
+
+    val groupedDF = df.groupBy("offer_id").agg(org.apache.spark.sql.functions.sum(column).alias("total"))
+
+    groupedDF.collect().foreach { row =>
+      val offerId = row.getString(0)
+      val totalValue = row.getDouble(1)
+
+      val isOutOfRange = totalValue < lowerBound || totalValue > upperBound
+      val status = if (isOutOfRange) "FAILED" else "PASSED"
+      val message = if (isOutOfRange) s"Range validation failed for offer_id $offerId" else s"Range validation passed for offer_id $offerId"
+
+      logValidationResult(
+        spark, jobId, queryId, querySql, offerId, "range",
+        s"$lowerBound <= x <= $upperBound", None, totalValue, status, message
+      )
+
+      if (isOutOfRange) {
+        actionHandler.handleAction(validation.rules.head, queryId, totalValue.toString, logger)
+      }
+    }
+  }
+}
+
+
+
+
+class JobManager(spark: SparkSession) {
+  def getCompletedQueries(jobId: String): Set[String] = {
+    val resultsDF = spark.sql(s"SELECT query_id FROM query_execution_results WHERE job_id = '$jobId' AND status = 'SUCCESS'")
+    resultsDF.collect().map(_.getString(0)).toSet
+  }
+
+  def getMailStatus(jobId: String): String = {
+    val statusDF = spark.sql(s"SELECT mail_status FROM job_status_table WHERE job_id = '$jobId'")
+    if (statusDF.isEmpty) "PENDING" else statusDF.first().getString(0)
+  }
+
+  def updateJobStatus(jobId: String, status: String): Unit = {
+    spark.sql(s"INSERT INTO job_status_table VALUES ('$jobId', '$status', 'PENDING', current_timestamp())")
+  }
+
+  def updateMailStatus(jobId: String, mailStatus: String): Unit = {
+    spark.sql(s"UPDATE job_status_table SET mail_status = '$mailStatus', timestamp = current_timestamp() WHERE job_id = '$jobId'")
+  }
+}
+
+
+
+class GroupByValidation extends ValidationStrategy {
+  override def validate(data: DataFrame, validation: Validation): Boolean = {
+    val groupedData = data.groupBy(validation.columns.get.head).count()
+    val maxValue = groupedData.agg(max("count")).first().getLong(0)
+
+    validation.rules.forall(rule => {
+      rule.condition match {
+        case "BETWEEN" => maxValue >= rule.lower_bound.get && maxValue <= rule.upper_bound.get
+        case _ => throw new IllegalArgumentException(s"Unsupported condition: ${rule.condition}")
+      }
+    })
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+

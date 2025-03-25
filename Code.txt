@@ -313,6 +313,77 @@ class GroupByValidation extends ValidationStrategy {
 
 
 
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import org.apache.spark.sql.functions._
+
+class ActionHandler(spark: SparkSession, emailService: EmailService) {
+
+  private val hiveTable = "validation_logs"
+
+  def processValidationResults(results: List[ValidationResult]): Unit = {
+    // Convert results to DataFrame
+    import spark.implicits._
+    val resultsDF = results.toDF()
+
+    // Write to Hive for transparency
+    saveResultsToHive(resultsDF)
+
+    // Consolidate failed validations
+    val failedValidations = results.filter(_.status == "FAILED")
+    
+    if (failedValidations.nonEmpty) {
+      sendConsolidatedAlert(failedValidations)
+    }
+  }
+
+  private def saveResultsToHive(df: DataFrame): Unit = {
+    df.write.mode("append").saveAsTable(hiveTable)
+  }
+
+  private def sendConsolidatedAlert(failedValidations: List[ValidationResult]): Unit = {
+    val alertMessage = failedValidations.map(v => 
+      s"Offer ID: ${v.offerId}, Validation: ${v.validationType}, Message: ${v.message}"
+    ).mkString("\n")
+
+    emailService.sendEmail(
+      subject = "Validation Breach Alert",
+      body = alertMessage
+    )
+  }
+}
+
+
+
+case class ValidationResult(offerId: String, validationType: String, status: String, message: String)
+
+trait EmailService {
+  def sendEmail(subject: String, body: String): Unit
+}
+
+class DefaultEmailService extends EmailService {
+  override def sendEmail(subject: String, body: String): Unit = {
+    println(s"Sending Email: \nSubject: $subject\nBody: \n$body")
+    // Add email API integration here
+  }
+}
+
+
+val emailService = new DefaultEmailService()
+val actionHandler = new ActionHandler(spark, emailService)
+
+val validationResults: List[ValidationResult] = List(
+  ValidationResult("OFFER_1", "count", "FAILED", "Customer count exceeded threshold."),
+  ValidationResult("OFFER_2", "null_check", "PASSED", "No null values found.")
+)
+
+// Process validation results
+actionHandler.processValidationResults(validationResults)
+
+
+
+
+
+
 
 
 

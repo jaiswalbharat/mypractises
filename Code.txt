@@ -431,6 +431,62 @@ actionChecker.checkPendingActions(jobId = "20250318_001")
 
 
 
+package validator
+
+import model.{ValidationRule, ValidationResult, ValidationType}
+import org.apache.spark.sql.{DataFrame, Row}
+import org.apache.spark.sql.functions._
+import utils.PlaceholderResolver
+
+class GroupCountValidator extends BaseValidator {
+
+  override def validate(df: DataFrame, validationType: ValidationType): Seq[ValidationResult] = {
+    val columnToCheck = validationType.column.getOrElse(
+      throw new IllegalArgumentException("GroupCountValidator requires 'column'")
+    )
+    val groupByCols = validationType.groupBy.getOrElse(
+      throw new IllegalArgumentException("GroupCountValidator requires 'groupBy'")
+    )
+
+    val resolvedDf = df.select((groupByCols :+ columnToCheck).map(col): _*)
+
+    resolvedDf.collect().flatMap { row =>
+      val countValue = row.getAs[Number](columnToCheck).doubleValue()
+      val groupKey = groupByCols.map(colName => colName -> row.getAs[Any](colName).toString).toMap
+
+      validationType.rules.map { rule =>
+        val conditionMet = evaluateCondition(countValue, rule.condition, rule.value.toDouble)
+        val status = if (conditionMet) "FAILED" else "PASSED"
+        val resolvedMessage = PlaceholderResolver.resolve(rule.message, groupKey + ("value" -> countValue.toString))
+
+        ValidationResult(
+          validationId = validationType.id,
+          validationType = "group_count",
+          group = Some(groupKey),
+          column = Some(columnToCheck),
+          actualValue = Some(countValue.toString),
+          threshold = Some(rule.value.toString),
+          status = status,
+          action = Some(rule.action),
+          message = resolvedMessage
+        )
+      }
+    }
+  }
+
+  private def evaluateCondition(actual: Double, condition: String, threshold: Double): Boolean = {
+    condition match {
+      case "EQUAL" => actual == threshold
+      case "GREATER_THAN" => actual > threshold
+      case "LESS_THAN" => actual < threshold
+      case "BETWEEN" => false // handled elsewhere if needed
+      case _ => throw new IllegalArgumentException(s"Unknown condition: $condition")
+    }
+  }
+}
+
+
+
 
 
 
